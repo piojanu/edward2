@@ -132,8 +132,11 @@ def main(argv):
 
   with strategy.scope():
     logging.info('Building Keras ResNet-50 model')
-    model = deterministic_model.resnet50(input_shape=(224, 224, 3),
-                                         num_classes=NUM_CLASSES)
+    if True:
+      model = deterministic_model.resnet50(input_shape=(224, 224, 3),
+                                           num_classes=NUM_CLASSES)
+    else:
+      model = tf.keras.models.load_model(latest_checkpoint)
     logging.info('Model input shape: %s', model.input_shape)
     logging.info('Model output shape: %s', model.output_shape)
     logging.info('Model number of weights: %s', model.count_params())
@@ -170,7 +173,8 @@ def main(argv):
 
     logging.info('Finished building Keras ResNet-50 model')
 
-    checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
+    # checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer)
     latest_checkpoint = tf.train.latest_checkpoint(FLAGS.output_dir)
     initial_epoch = 0
     if latest_checkpoint:
@@ -321,6 +325,7 @@ def main(argv):
   final_checkpoint_name = checkpoint.save(
       os.path.join(FLAGS.output_dir, 'checkpoint'))
   logging.info('Saved last checkpoint to %s', final_checkpoint_name)
+  model.save(os.path.join(FLAGS.output_dir, 'model'))
 
 if __name__ == '__main__':
   app.run(main)

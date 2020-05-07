@@ -31,18 +31,18 @@ from absl import flags
 from absl import logging
 
 import edward2 as ed
-import deterministic_model  # local file import
 import utils  # local file import
 import numpy as np
 import tensorflow.compat.v2 as tf
+import tensorflow_hub as hub
 
 flags.DEFINE_integer('per_core_batch_size', 512, 'Batch size per TPU core/GPU.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('data_dir', None, 'Path to training and testing data.')
 flags.mark_flag_as_required('data_dir')
-flags.DEFINE_string('checkpoint_dir', None,
+flags.DEFINE_string('model_dir', None,
                     'The directory where the model weights are stored.')
-flags.mark_flag_as_required('checkpoint_dir')
+flags.mark_flag_as_required('model_dir')
 flags.DEFINE_string('output_dir', '/tmp/imagenet',
                     'The directory where to save predictions.')
 flags.DEFINE_string('alexnet_errors_path', None,
@@ -58,7 +58,6 @@ FLAGS = flags.FLAGS
 
 # Number of images in eval dataset.
 IMAGENET_VALIDATION_IMAGES = 50000
-NUM_CLASSES = 1000
 
 
 def ensemble_negative_log_likelihood(labels, logits):
@@ -81,8 +80,12 @@ def ensemble_negative_log_likelihood(labels, logits):
   labels = tf.cast(labels, tf.int32)
   logits = tf.convert_to_tensor(logits)
   ensemble_size = float(logits.shape[0])
+  # TODO(trandustin): broadcast error is because logits somehow has 0 in last
+  # axis. so -1 includes num_classes which it shouldn't for broadcasting
+  # temp = tf.broadcast_to(labels[tf.newaxis, ...], tf.shape(logits)[:-1])
   nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      tf.broadcast_to(labels[tf.newaxis, ...], tf.shape(logits)[:-1]),
+      # tf.broadcast_to(labels[tf.newaxis, ...], tf.shape(logits)[:-1]),
+      tf.broadcast_to(labels[tf.newaxis, ...], tf.shape(logits)[:1]),
       logits)
   return -tf.reduce_logsumexp(-nll, axis=0) + tf.math.log(ensemble_size)
 
@@ -116,16 +119,23 @@ def gibbs_cross_entropy(labels, logits):
 
 def main(argv):
   del argv  # unused arg
-  if not FLAGS.use_gpu:
-    raise ValueError('Only GPU is currently supported.')
-  if FLAGS.num_cores > 1:
-    raise ValueError('Only a single accelerator is currently supported.')
   tf.enable_v2_behavior()
   tf.random.set_seed(FLAGS.seed)
   tf.io.gfile.makedirs(FLAGS.output_dir)
 
   batch_size = FLAGS.per_core_batch_size * FLAGS.num_cores
   steps_per_eval = IMAGENET_VALIDATION_IMAGES // batch_size
+
+  if FLAGS.use_gpu:
+    logging.info('Use GPU')
+    strategy = tf.distribute.MirroredStrategy()
+  else:
+    logging.info('Use TPU at %s',
+                 FLAGS.tpu if FLAGS.tpu is not None else 'local')
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=FLAGS.tpu)
+    tf.config.experimental_connect_to_cluster(resolver)
+    tf.tpu.experimental.initialize_tpu_system(resolver)
+    strategy = tf.distribute.experimental.TPUStrategy(resolver)
 
   dataset_test = utils.ImageNetInput(
       is_training=False,
@@ -137,34 +147,38 @@ def main(argv):
   for name in corruption_types:
     for intensity in range(1, max_intensity + 1):
       dataset_name = '{0}_{1}'.format(name, intensity)
-      test_datasets[dataset_name] = utils.load_corrupted_test_dataset(
-          name=name,
-          intensity=intensity,
-          batch_size=FLAGS.per_core_batch_size,
-          drop_remainder=True,
-          use_bfloat16=False)
+      # test_datasets[dataset_name] = utils.load_corrupted_test_dataset(
+      #     name=name,
+      #     intensity=intensity,
+      #     batch_size=FLAGS.per_core_batch_size,
+      #     drop_remainder=True,
+      #     use_bfloat16=False)
 
-  model = deterministic_model.resnet50(input_shape=(224, 224, 3),
-                                       num_classes=NUM_CLASSES)
-
-  logging.info('Model input shape: %s', model.input_shape)
-  logging.info('Model output shape: %s', model.output_shape)
-  logging.info('Model number of weights: %s', model.count_params())
-  # Search for checkpoints from their index file; then remove the index suffix.
-  ensemble_filenames = tf.io.gfile.glob(os.path.join(FLAGS.checkpoint_dir,
-                                                     '**/*.index'))
-  ensemble_filenames = [filename[:-6] for filename in ensemble_filenames]
+  # Search for SavedModels from their index file; then remove the index suffix.
+  # TODO(trandustin)
+  # ensemble_filenames = tf.io.gfile.glob(os.path.join(FLAGS.model_dir,
+  #                                                    '**/*.index'))
+  # ensemble_filenames = [filename[:-6] for filename in ensemble_filenames]
+  ensemble_filenames = [FLAGS.model_dir]
   ensemble_size = len(ensemble_filenames)
   logging.info('Ensemble size: %s', ensemble_size)
-  logging.info('Ensemble number of weights: %s',
-               ensemble_size * model.count_params())
   logging.info('Ensemble filenames: %s', str(ensemble_filenames))
-  checkpoint = tf.train.Checkpoint(model=model)
+
+  @tf.function
+  def fn(features):
+    batch_logits = strategy.run(model,
+                                args=(features,),
+                                kwargs={'training': False})
+    batch_logits = tf.concat(
+        strategy.experimental_local_results(batch_logits), axis=0)
+    return batch_logits
 
   # Write model predictions to files.
   num_datasets = len(test_datasets)
   for m, ensemble_filename in enumerate(ensemble_filenames):
-    checkpoint.restore(ensemble_filename)
+    with strategy.scope():
+      # model = hub.KerasLayer(ensemble_filename)
+      model = tf.keras.models.load_model(ensemble_filename)
     for n, (name, test_dataset) in enumerate(test_datasets.items()):
       filename = '{dataset}_{member}.npy'.format(dataset=name, member=m)
       filename = os.path.join(FLAGS.output_dir, filename)
@@ -173,7 +187,8 @@ def main(argv):
         test_iterator = iter(test_dataset)
         for _ in range(steps_per_eval):
           features, _ = next(test_iterator)
-          logits.append(model(features, training=False))
+          batch_logits = fn(features)
+          logits.append(batch_logits)
 
         logits = tf.concat(logits, axis=0)
         with tf.io.gfile.GFile(filename, 'w') as f:
@@ -214,7 +229,8 @@ def main(argv):
     test_iterator = iter(test_dataset)
     for step in range(steps_per_eval):
       _, labels = next(test_iterator)
-      logits = logits_dataset[:, (step*batch_size):((step+1)*batch_size)]
+      logits = logits_dataset[
+          :, step*FLAGS.per_core_batch_size:(step+1)*FLAGS.per_core_batch_size]
       labels = tf.cast(tf.reshape(labels, [-1]), tf.int32)
       negative_log_likelihood = tf.reduce_mean(
           ensemble_negative_log_likelihood(labels, logits))
